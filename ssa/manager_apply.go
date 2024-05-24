@@ -28,11 +28,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	ssaerrors "github.com/fluxcd/pkg/ssa/errors"
+	"github.com/fluxcd/pkg/ssa/jsondiff"
 	"github.com/fluxcd/pkg/ssa/utils"
 )
 
@@ -157,48 +159,73 @@ func (m *ResourceManager) ApplyAll(ctx context.Context, objects []*unstructured.
 			i, object := i, object
 
 			g.Go(func() error {
-				existingObject := &unstructured.Unstructured{}
-				existingObject.SetGroupVersionKind(object.GroupVersionKind())
-				getError := m.client.Get(ctx, client.ObjectKeyFromObject(object), existingObject)
+				var existingObject *unstructured.Unstructured
+				var changeType Action
+				immutable := false
+				dryRunObject := object.DeepCopy()
+
+				diffOpts := []jsondiff.ListOption{
+					jsondiff.ExclusionSelector(opts.ExclusionSelector),
+					jsondiff.FieldOwner(m.owner.Field),
+					jsondiff.Graceful(true),
+				}
+
+				// Fetch, compare, and generate diff between desired and actual object
+				diffSet, err := jsondiff.UnstructuredList(ctx, m.client, []*unstructured.Unstructured{dryRunObject}, diffOpts...)
+				switch t := err.(type) {
+				case nil:
+					// No error; existingObject in Diff as *client.Object
+					changeType = m.diffTypeToAction(diffSet[0].Type)
+					existingObject = m.clientObjectToUnstructured(diffSet[0].ClusterObject)
+				case *ssaerrors.DryRunImmutableErr:
+					// Immutable error; existingObject in Err as *unstructured.Unstructured
+					immutable = true
+					existingObject = t.ExistingObject()
+				case *ssaerrors.DryRunErr:
+					return err
+				default:
+					return ssaerrors.NewDryRunErr(err, dryRunObject)
+				}
 
 				if m.shouldSkipApply(object, existingObject, opts) {
 					changes[i] = *m.changeSetEntry(existingObject, SkippedAction)
 					return nil
 				}
 
-				dryRunObject := object.DeepCopy()
-				if err := m.dryRunApply(ctx, dryRunObject); err != nil {
-					// We cannot have an immutable error (and therefore shouldn't force-apply) if the resource doesn't
-					// exist on the cluster. Note that resource might not exist because we wrongly identified an error
-					// as immutable and deleted it when ApplyAll was called the last time (the check for ImmutableError
-					// returns false positives)
-					if !errors.IsNotFound(getError) && m.shouldForceApply(object, existingObject, opts, err) {
-						if err := m.client.Delete(ctx, existingObject, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
-							return fmt.Errorf("%s immutable field detected, failed to delete object: %w",
-								utils.FmtUnstructured(dryRunObject), err)
-						}
-
-						// Wait until deleted (in case of any finalizers).
-						err = wait.PollUntilContextCancel(ctx, opts.WaitInterval, true, func(ctx context.Context) (bool, error) {
-							err := m.client.Get(ctx, client.ObjectKeyFromObject(object), existingObject)
-							if err != nil && errors.IsNotFound(err) {
-								// Object has been deleted.
-								return true, nil
-							}
-							// Object still exists, or we got another error than NotFound.
-							return false, err
-						})
-						if err != nil {
-							return fmt.Errorf("%s immutable field detected, failed to wait for object to be deleted: %w",
-								utils.FmtUnstructured(dryRunObject), err)
-						}
-
-						err = m.dryRunApply(ctx, dryRunObject)
-					}
-
-					if err != nil {
+				if immutable {
+					if !m.shouldForceApply(object, existingObject, opts, err) {
 						return ssaerrors.NewDryRunErr(err, dryRunObject)
 					}
+
+					// Note that the check for ImmutableError returns false positives. The resource might not exist
+					// because we wrongly identified an error as immutable and deleted it the last time ApplyAll
+					// was called.
+					if err := m.client.Delete(ctx, existingObject, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+						return fmt.Errorf("%s immutable field detected, failed to delete object: %w",
+							utils.FmtUnstructured(dryRunObject), err)
+					}
+
+					// Wait until deleted (in case of any finalizers).
+					err = wait.PollUntilContextCancel(ctx, opts.WaitInterval, true, func(ctx context.Context) (bool, error) {
+						err := m.client.Get(ctx, client.ObjectKeyFromObject(object), existingObject)
+						if err != nil && errors.IsNotFound(err) {
+							// Object has been deleted.
+							existingObject = nil
+							return true, nil
+						}
+						// Object still exists, or we got another error than NotFound.
+						return false, err
+					})
+					if err != nil {
+						return fmt.Errorf("%s immutable field detected, failed to wait for object to be deleted: %w",
+							utils.FmtUnstructured(dryRunObject), err)
+					}
+
+					if err = m.dryRunApply(ctx, dryRunObject); err != nil {
+						return ssaerrors.NewDryRunErr(err, dryRunObject)
+					}
+
+					changeType = ConfiguredAction
 				}
 
 				patched, err := m.cleanupMetadata(ctx, object, existingObject, opts.Cleanup)
@@ -206,17 +233,16 @@ func (m *ResourceManager) ApplyAll(ctx context.Context, objects []*unstructured.
 					return fmt.Errorf("%s metadata.managedFields cleanup failed: %w",
 						utils.FmtUnstructured(existingObject), err)
 				}
-
-				if patched || m.hasDrifted(existingObject, dryRunObject) {
-					toApply[i] = object
-					if dryRunObject.GetResourceVersion() == "" {
-						changes[i] = *m.changeSetEntry(dryRunObject, CreatedAction)
-					} else {
-						changes[i] = *m.changeSetEntry(dryRunObject, ConfiguredAction)
-					}
-				} else {
-					changes[i] = *m.changeSetEntry(dryRunObject, UnchangedAction)
+				if patched {
+					changeType = ConfiguredAction
 				}
+
+				if changeType == ConfiguredAction || changeType == CreatedAction {
+					toApply[i] = object
+				}
+
+				changes[i] = *m.changeSetEntry(dryRunObject, changeType)
+
 				return nil
 			})
 		}
@@ -305,13 +331,14 @@ func (m *ResourceManager) cleanupMetadata(ctx context.Context,
 	desiredObject *unstructured.Unstructured,
 	object *unstructured.Unstructured,
 	opts ApplyCleanupOptions) (bool, error) {
+	if object == nil {
+		return false, nil
+	}
+
 	if utils.AnyInMetadata(desiredObject, opts.Exclusions) || utils.AnyInMetadata(object, opts.Exclusions) {
 		return false, nil
 	}
 
-	if object == nil {
-		return false, nil
-	}
 	existingObject := object.DeepCopy()
 	var patches []jsonPatch
 
@@ -378,4 +405,33 @@ func (m *ResourceManager) shouldSkipApply(desiredObject *unstructured.Unstructur
 	}
 
 	return false
+}
+
+// clientObjectToUnstructured type converts a *client.Object into an *unstructured.Unstructured.
+func (m *ResourceManager) clientObjectToUnstructured(obj client.Object) *unstructured.Unstructured {
+	// Sanity check that the passed object can be converted to Unstructured. It is possible
+	// for an Object to come back as a context cancelled error rather than something that
+	// can be converted to Unstructured.
+	if obj == nil || obj.GetName() == "" {
+		return nil
+	}
+
+	existingObjectMap, _ := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	return &unstructured.Unstructured{Object: existingObjectMap}
+}
+
+// diffTypeToAction maps a jsondiff.DiffType to an associated Action
+func (m *ResourceManager) diffTypeToAction(t jsondiff.DiffType) Action {
+	switch t {
+	case jsondiff.DiffTypeCreate:
+		return CreatedAction
+	case jsondiff.DiffTypeUpdate:
+		return ConfiguredAction
+	case jsondiff.DiffTypeExclude:
+		return SkippedAction
+	case jsondiff.DiffTypeNone:
+		return UnchangedAction
+	default:
+		return UnknownAction
+	}
 }
