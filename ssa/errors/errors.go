@@ -76,3 +76,40 @@ func (e *DryRunErr) Error() string {
 func (e *DryRunErr) Unwrap() error {
 	return e.underlyingErr
 }
+
+// DryRunErr is an error that occurs when a server-side dry-run apply fails due to an immutable resource error.
+type DryRunImmutableErr struct {
+	*DryRunErr
+	existingObject *unstructured.Unstructured
+}
+
+// NewDryRunImmutableErr returns a new DryRunImmutableErr.
+func NewDryRunImmutableErr(err error, involvedObject, existingObject *unstructured.Unstructured) *DryRunImmutableErr {
+	return &DryRunImmutableErr{
+		&DryRunErr{
+			underlyingErr:  err,
+			involvedObject: involvedObject,
+		},
+		existingObject,
+	}
+}
+
+// InvolvedObject returns the involved object.
+func (e *DryRunImmutableErr) InvolvedObject() *unstructured.Unstructured {
+	return e.involvedObject
+}
+
+// ExistingObject returns the existing object.
+func (e *DryRunImmutableErr) ExistingObject() *unstructured.Unstructured {
+	return e.existingObject
+}
+
+// Error returns the error message.
+func (e *DryRunImmutableErr) Error() string {
+	return NewDryRunErr(e.underlyingErr, e.involvedObject).Error()
+}
+
+// Unwrap returns the underlying error.
+func (e *DryRunImmutableErr) Unwrap() error {
+	return e.underlyingErr
+}

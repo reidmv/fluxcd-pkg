@@ -149,6 +149,9 @@ func Unstructured(ctx context.Context, c client.Client, obj *unstructured.Unstru
 		client.FieldOwner(o.FieldManager),
 	}
 	if err := c.Patch(ctx, dryRunObj, client.Apply, patchOpts...); err != nil {
+		if ssaerrors.IsImmutableError(err) {
+			return nil, ssaerrors.NewDryRunImmutableErr(err, obj, existingObj)
+		}
 		return nil, ssaerrors.NewDryRunErr(err, obj)
 	}
 
