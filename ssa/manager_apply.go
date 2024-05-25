@@ -55,6 +55,10 @@ type ApplyOptions struct {
 	// based on the matching labels or annotations.
 	IfNotPresentSelector map[string]string `json:"ifNotPresentSelector"`
 
+	// DiffIgnoreRules defines rules for when to disregard changes detected in differenitial
+	// for the purpose of determining if drift has occurred.
+	DiffIgnoreRules jsondiff.IgnoreRules
+
 	// WaitInterval defines the interval at which the engine polls for cluster
 	// scoped resources to reach their final state.
 	WaitInterval time.Duration `json:"waitInterval"`
@@ -168,6 +172,7 @@ func (m *ResourceManager) ApplyAll(ctx context.Context, objects []*unstructured.
 					jsondiff.ExclusionSelector(opts.ExclusionSelector),
 					jsondiff.FieldOwner(m.owner.Field),
 					jsondiff.Graceful(true),
+					opts.DiffIgnoreRules,
 				}
 
 				// Fetch, compare, and generate diff between desired and actual object
